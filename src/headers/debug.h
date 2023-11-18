@@ -3,6 +3,11 @@
 
 #include <iostream>
 
+#define BLNK_ON         "\033[?12h"
+#define BLNK_OFF        "\033[?12l"
+#define SHOW_CUR        "\033[?25h"
+#define HIDE_CUR        "\033[?25l"
+
 #define RED_CLR         "\033[31m"
 #define GREEN_CLR       "\033[32m"
 #define YELLOW_CLR      "\033[33m"

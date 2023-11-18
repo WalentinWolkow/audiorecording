@@ -4,7 +4,8 @@
 #include <math.h>
 #include <getopt.h>
 
-#include <sstream>
+//#include <sstream>
+#include <iomanip>
 
 // Static public members
 const char *AudioRecorder::helpStr = "Usage: audiorecording [options]\n"
@@ -82,45 +83,68 @@ bool AudioRecorder::record()
     if (!audioBuf)
         return false;
 
-    // Open temporary file for write data
-    std::string tmpFileName;
+    // Open file for saving data
+    FILE *fdOut = fopen(outFileStr.c_str(), "w+");
+    if (fdOut == NULL)
     {
-        std::stringstream ss;
-        ss << time(0);
-
-        tmpFileName = "tmp" + ss.str() + ".bin";
-    }
-//    DBG("tmpFileName = \"" << tmpFileName << '\"');
-
-    FILE *fdTmp = fopen(tmpFileName.c_str(), "w+");
-    if (fdTmp == NULL)
-    {
-        errStr = "Can not open tmp output file!";
+        errStr = "Can not open output file: \"" + outFileStr + "\"!";
         ERR(errStr);
+
         return false;
     }
+
+    // Determine if a wav-header is needed
+    bool hasWavHeader;
+    {
+        size_t pos = outFileStr.rfind(".wav");
+        hasWavHeader = pos != std::string::npos && outFileStr.size() - pos == 4;
+    }
+
+    void *dataBuf;
+    size_t dataBufSize;
+
+    if (hasWavHeader)
+        dataBufSize = sizeof(wavHeader.data);
+    else
+        dataBufSize = sizeof(short);
+
+    if ((dataBuf = malloc(dataBufSize)) == NULL)
+    {
+        fclose(fdOut);
+
+        errStr = "Can not allocate memory space for data buffer!";
+        ERR(errStr);
+
+        return false;
+    }
+    dataBufSize = 0;    // force zero
+
+    // Reserve space for WAV-header in file, if it's necessary
+    if (hasWavHeader)
+        fwrite((void *)dataBuf, sizeof(char), sizeof(wavHeader.data), fdOut);
 
     // Start streaming
     if (snd_pcm_start(audioBuf) != 0)
     {
         errStr = "snd_pcm_start(audioBuf) error!";
         ERR(errStr);
-        fclose(fdTmp);
 
         return false;
     }
 
     int res = 0;
     // Read audio samples from audio buffer and write to temporary file
-    for (u_int framesCount = 0, framesCountMax = sampleRate * timeToRec; framesCount < framesCountMax; )
+    for (u_int samplesCount = 0, samplesCountMax = sampleRate * timeToRec; samplesCount < samplesCountMax; )
     {
+        static size_t timeExpired = 0;
+        static size_t samplesPerSec = 0;
+
         if (res < 0)
         {
             if (abufHandleError(res) != 0)
             {
                 errStr = "abufHandleError(res)";
                 ERR(errStr);
-                fclose(fdTmp);
 
                 return false;
             }
@@ -131,7 +155,6 @@ bool AudioRecorder::record()
                 {
                     errStr = "Streaming restart error!";
                     ERR(errStr);
-                    fclose(fdTmp);
 
                     return false;
                 }
@@ -144,11 +167,11 @@ bool AudioRecorder::record()
         // Get audio data region available for reading
         const snd_pcm_channel_area_t *areas;
         snd_pcm_uframes_t offset;
-        snd_pcm_uframes_t frames = bufSize / frameSize;
-        if ((res = snd_pcm_mmap_begin(audioBuf, &areas, &offset, &frames)) != 0)
+        snd_pcm_uframes_t samples = bufSize / sampleSize;
+        if ((res = snd_pcm_mmap_begin(audioBuf, &areas, &offset, &samples)) != 0)
             continue;
 
-        if (frames == 0)
+        if (samples == 0)
         {
             // Buffer is empty. Wait 100ms until some new data is available
             int period_ms = 100;
@@ -157,137 +180,93 @@ bool AudioRecorder::record()
             continue;
         }
 
-        framesCount += frames;
+        // Increase data buffer size if necessary
+        size_t dataBlockSize = samples * sampleSize;
+        if (dataBufSize < dataBlockSize)
+        {
+            free(dataBuf);
+            if ((dataBuf = malloc(dataBlockSize)) == NULL)
+            {
+                fclose(fdOut);
 
-        // Write to file
-        fwrite((char *)areas[0].addr + offset * areas[0].step / 8, sizeof(char), frames * frameSize, fdTmp);
+                errStr = "Can not allocate memory space for data buffer!";
+                ERR(errStr);
+
+                return false;
+            }
+        }
+
+        // Copy data from ring buffer
+        {
+            char *src = (char *)areas[0].addr + offset * areas[0].step / 8,
+                 *dst = (char *)dataBuf;
+            for (size_t i = 0; i < dataBlockSize; )
+            {
+                dst[i] = src[i];
+
+                if (++i % sampleSize == 0)
+                    if (++samplesPerSec == sampleRate)
+                    {
+                        samplesPerSec = 0;
+                        ++timeExpired;
+                    }
+            }
+        }
+
+        samplesCount += samples;
 
         // Mark the data chunk as read
-        res = snd_pcm_mmap_commit(audioBuf, offset, frames);
-        if (res >= 0 && (snd_pcm_uframes_t)res != frames)
-            // Not all frames are processed
+        res = snd_pcm_mmap_commit(audioBuf, offset, samples);
+        if (res >= 0 && (snd_pcm_uframes_t)res != samples)
+            // Not all samples are processed
             res = -EPIPE;
-    }
 
-    fclose(fdTmp);
-    // End of write to tmp file, now we need add .wav-header and apply gain
+        // ...
 
-    // Create buffer for proccesing data
-    #define     SIZE_OF_BUF     2048
-    short *dataBuf = (short *)malloc(SIZE_OF_BUF * sizeof(short));
-    if (dataBuf == NULL)
-    {
-        errStr = "Can not allocate memory space for data buffer!";
-        ERR(errStr);
+        // Write to file
+        fwrite(dataBuf, sizeof(char), dataBlockSize, fdOut);
 
-        return false;
-    }
-
-    // Open tmp file for read
-    fdTmp = fopen(tmpFileName.c_str(), "r");
-    if (fdTmp == NULL)
-    {
-        free((void *)dataBuf);
-        errStr = "Can not open tmp file for read!";
-        ERR(errStr);
-
-        return false;
-    }
-
-    // Determine the gain
-    float coeff = powf(10.0, gainFactor / 20.0);
-    {
-        // Determine the maximum permissible gain
-        float coeffMax = 1.0;
+        if (!samplesPerSec)
         {
-            short minValue = 0x7FFF, maxValue = 0x8000;
-            for (size_t itemsCount = SIZE_OF_BUF; itemsCount == SIZE_OF_BUF; )
+            // ...
+
+            if (verbose)
             {
-                itemsCount = fread(dataBuf, sizeof(short), SIZE_OF_BUF, fdTmp);
+                size_t hours = timeExpired / 3600,
+                       mins = timeExpired % 3600 / 60,
+                       secs = timeExpired % 60;
 
-                for (int i = 0; i < itemsCount; ++i)
-                {
-                    if (minValue > dataBuf[i])
-                        minValue = dataBuf[i];
-
-                    if (maxValue < dataBuf[i])
-                        maxValue = dataBuf[i];
-                }
-            }
-
-            if (minValue != 0x8000 && maxValue != 0x7FFF)
-            {
-                minValue = minValue < 0 ? -minValue : minValue;
-                maxValue = maxValue > minValue ? maxValue : minValue;
-
-                coeffMax = 32768.0 / maxValue;
-            }
-
-            if (coeff > coeffMax)
-            {
-                coeff = coeffMax;
-                ERR("It is not possible to apply a gain of " << gainFactor << "dB, " << 20 * log10(coeffMax) << "dB will be applied!");
+                std::cerr << '\r' << HIDE_CUR
+                          << std::setfill('0') << std::setw(2) << hours << ':'
+                          << std::setfill('0') << std::setw(2) << mins << ':'
+                          << std::setfill('0') << std::setw(2) << secs;
             }
         }
     }
-//    DBG("coeff = " << coeff);
 
-    // Open file for save data
-    FILE *fdOut = fopen(outFileStr.c_str(), "w+");
-    if (fdOut == NULL)
+    if (verbose)
+        std::cout << SHOW_CUR << std::endl;
+
+    free(dataBuf);
+
+    if (hasWavHeader)
     {
-        fclose(fdTmp);
-        free((void *)dataBuf);
-        errStr = "Can not open output file: \"" + outFileStr + "\"!";
-        ERR(errStr);
+        // Prepare wav-header
+        fseek(fdOut, 0, SEEK_END);
+        long fileSize = ftell(fdOut);
 
-        return false;
+        wavHeader.fields.chunkSize = fileSize + sizeof(wavHeader.data) - sizeof(wavHeader.fields.chunkId) - sizeof(wavHeader.fields.chunkSize);
+        wavHeader.fields.numChannels = chansNumber;
+        wavHeader.fields.sampleRate = sampleRate;
+        wavHeader.fields.byteRate = chansNumber * sampleRate * 2;
+        wavHeader.fields.blockAlign = chansNumber * 2;
+        wavHeader.fields.subchunk2Size = fileSize;
+
+        fseek(fdOut, 0, SEEK_SET);
+        fwrite(wavHeader.data, sizeof(char), sizeof(wavHeader.data), fdOut);
     }
 
-    // Determine if a wav-header is needed
-    {
-        size_t pos1, pos2,
-               strSize = outFileStr.size();;
-
-        pos1 = outFileStr.rfind(".wav");
-        pos2 = outFileStr.rfind(".WAV");
-
-        if (strSize - pos1 == 4 || strSize - pos2 == 4)
-        {
-            // Prepare wav-header
-            fseek(fdTmp, 0, SEEK_END);
-            int tmpFileSize = ftell(fdTmp);
-
-            wavHeader.fields.chunkSize = tmpFileSize + sizeof(wavHeader.data) - sizeof(wavHeader.fields.chunkId) - sizeof(wavHeader.fields.chunkSize);
-            wavHeader.fields.numChannels = chansNumber;
-            wavHeader.fields.sampleRate = sampleRate;
-            wavHeader.fields.byteRate = chansNumber * sampleRate * 2;
-            wavHeader.fields.blockAlign = chansNumber * 2;
-            wavHeader.fields.subchunk2Size = tmpFileSize;
-
-            fwrite(wavHeader.data, sizeof(char), sizeof(wavHeader.data), fdOut);
-        }
-    }
-
-    fseek(fdTmp, 0, SEEK_SET);
-
-    for (size_t itemsCount = SIZE_OF_BUF; itemsCount == SIZE_OF_BUF; )
-    {
-        itemsCount = fread(dataBuf, sizeof(short), SIZE_OF_BUF, fdTmp);
-
-        for (int i = 0; i < itemsCount; ++i)
-            dataBuf[i] *= coeff;
-
-        fwrite(dataBuf, sizeof(short), itemsCount, fdOut);
-    }
-    #undef      SIZE_OF_BUF
-
-    fclose(fdTmp);
     fclose(fdOut);
-
-    free((void *)dataBuf);
-
-    remove(tmpFileName.c_str());
 
     return true;
 }
@@ -427,8 +406,8 @@ bool AudioRecorder::createAudioBuf()
         return false;
     }
 
-    frameSize = (16 / 8) * chansNumber;
-    bufSize = sampleRate * frameSize * buffer_length_usec / 1000000;
+    sampleSize = (16 / 8) * chansNumber;
+    bufSize = sampleRate * sampleSize * buffer_length_usec / 1000000;
 
     return true;
 }
